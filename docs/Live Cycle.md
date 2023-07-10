@@ -101,7 +101,7 @@ func main() {
 ./main.go:20:14: &S{} escapes to heap
 ```
 
-### 练习
+### for 陷阱
 来看下面代码，猜打印出来的结果是什么
 
 ```golang
@@ -120,9 +120,12 @@ func pase_student() {
         {Name: "li", Age: 23},
         {Name: "wang", Age: 22},
     }
-    for _, stu := range stus {
+
+    for _,stu := range stus {
         m[stu.Name] = &stu
     }
+
+
 	for k,v := range m{
 		fmt.Printf("%v = %v\n", k,v.Age);
 	}
@@ -139,7 +142,7 @@ zhou = &{zhou 24}
 li = &{li 23}
 wang = &{wang 22}
 ```
-那么恭喜你，完全错误，具体原因是由于 `m[stu.Name] = &stu` 的赋值操作在每次循环时都是将 `&stu` 赋给 `m[stu.Name]`，而 `&stu` 是指向 `stu` 的指针，而 `stu` 的地址在每次循环时都会发生变化。
+那么恭喜你，完全错误，具体原因是由于 `m[stu.Name] = &stu` 的赋值操作在每次循环时都是将 `&stu` 赋给 `m[stu.Name]`，而 `&stu` 是指向 `stu` 的指针，而 `stu` 的内存地址在第一次创建的时候就已经决定了。
 因此，当循环结束后，`m` 中的所有值都指向了同一个地址，即最后一次迭代的 `stu` 的地址，导致打印出来的内容中的值都一样，并且是最后一个学生的信息。
 
 所以，代码打印的内容是：
@@ -161,10 +164,120 @@ wang = &{Name:wang Age:22}
 ./main.go:20:14: k escapes to heap
 ./main.go:20:30: v.Age escapes to heap
 ```
+本来在`for .. in range` 循环作用域内的`stu`被移动到了堆上，这是因为对于 `for .. in range`来说，等效展开如下
+```golang
+    var stu student
+    for idx, _ := range stus {
+        stu = stus[idx]
+        m[stu.Name] = &stu
+    }
+```
+
+我们可以发现 `stu` 变量只创建了一次，然后在循环内每次将`stus`对应索引值的值赋值给`stu`，这就导致了在给`m`的指针其实是`stu`的内存位置
+
+既然知道了具体细节，我们就可以将代码改为下面的形式
+```golang
+    for idx, _ := range stus {
+        stu := stus[idx]
+        m[stu.Name] = &stu
+    }
+```
+再一次执行和逃逸分析
+```bash
+$ go run main.go 
+li = 23
+wang = 22
+zhou = 24
+
+$ go build --gcflags="-l -m"
+# go-learn
+./main.go:19:9: moved to heap: stu
+./main.go:10:14: make(map[string]*student) does not escape
+./main.go:11:22: []student{...} does not escape
+./main.go:27:13: ... argument does not escape
+./main.go:27:14: k escapes to heap
+./main.go:27:30: v.Age escapes to heap
+```
 
 
 ## 闭包
+闭包是指一个函数（或方法）和它引用的环境变量组合而成的实体。在Go语言中，当一个函数内部引用了自由变量(在闭包函数外定义但在函数内被引用)时，形成了闭包。
+闭包和函数最大的不同在于，当捕捉闭包的时候，它的自由变量会在捕捉时被确定，这样即便**脱离了捕捉时的上下文**，它也能照常运行
+闭包在运行时会自动创建一个包含了引用的变量的结构体，并将其分配在堆上。
 
+下面举几个例子来说明闭包的内存分配情况：
+
+### 示例1：
+```go
+func increment() func() int {
+    count := 0
+    return func() int {
+        count++
+        return count
+    }
+}
+
+func main() {
+    counter := increment()
+    fmt.Println(counter()) // 输出: 1
+    fmt.Println(counter()) // 输出: 2
+}
+```
+ 
+
+在这个例子中，`increment` 函数返回了一个匿名函数，该匿名函数引用了外部的 `count` 变量。
+我们来进行一次逃逸分析
+```bash
+./main.go:6:5: moved to heap: count
+./main.go:7:12: func literal escapes to heap
+./main.go:15:16: ... argument does not escape
+./main.go:15:24: counter() escapes to heap
+./main.go:16:16: ... argument does not escape
+./main.go:16:24: counter() escapes to heap
+```
+我们看到由于闭包的存在，`count` 变量被分配在堆上，而不是栈上。同样地，闭包函数本身也发生了逃逸，被分配到了堆上。这是因为闭包函数被返回给了外部调用者，并且可能在 `main` 函数中继续被调用。为了确保闭包函数在 `main` 函数执行完毕后依然有效，编译器将其分配到堆上，以延长其生命周期。
+值得注意的是，调用闭包函数的返回值 `counter()` 并没有发生逃逸，它并没有被分配到堆上，而是仍然在栈上分配。
+
+
+
+### 示例2：
+```go
+type Person struct {
+    name string
+}
+
+func getNameFunc(p *Person) func() string {
+    return func() string {
+        return p.name
+    }
+}
+
+func main() {
+    person := &Person{"Alice"}
+    getName := getNameFunc(person)
+    fmt.Println(getName()) // 输出: "Alice"
+}
+```
+
+按照惯例来个逃逸分析:
+```bash
+./main.go:10:18: leaking param: p
+./main.go:11:12: func literal escapes to heap
+./main.go:17:15: &Person{...} escapes to heap
+./main.go:20:16: ... argument does not escape
+./main.go:20:24: getName() escapes to heap
+```
+
+可以看出，`p` 参数和闭包函数都发生了逃逸，被分配到堆上。
+
+在函数 `getNameFunc` 中，我们返回了一个闭包函数，该闭包函数引用了参数 `p`。由于闭包函数可能在 `getNameFunc` 函数执行完毕后仍然存在和被调用，因此编译器将 `p` 参数分配到堆上，以确保闭包函数可以正常访问并使用它。
+
+同样地，闭包函数本身也发生了逃逸，被分配到了堆上。这是因为闭包函数被返回给了外部调用者，并且可能在 `main` 函数中继续被调用。为了确保闭包函数在 `main` 函数执行完毕后依然有效，编译器将其分配到堆上，以延长其生命周期。
+
+尽管 `person` 是通过` &Person{"Alice"}` 创建的，本质上是一个指向结构体的指针，但逃逸分析将其视为整个 `Person` 结构体发生了逃逸。这是因为 `getNameFunc` 函数返回的闭包函数引用了 `person` 变量，并且可能在 `main` 函数执行完毕后继续被调用。为了确保闭包函数可以正常访问 `person` 变量，编译器将 `person` 分配到了堆上，以延长其生命周期。
+
+
+这些例子说明，在闭包中，如果函数内部引用了外部的变量，那么这些被引用的变量会被分配在堆上，而不是栈上。这样可以确保闭包函数在其生命周期内可以正常访问这些外部变量，而不会因为栈上的变量释放导致错误。
 
 
 
