@@ -17,7 +17,40 @@
 2. Go 语言基础中是否存在与 java 的万物皆对象类似的基础原则，我注意到似乎不是所有东西都是对象，起码 err 不能用反射调查其属性和方法....
 误论，可以用下面代码来
 
-> 实际上是因为操作有误导致，错误类型跟一般的struct 类型稍微复杂一点，具体可以[反射](./Reflect.md)相关知识
+> 实际上可能是操作有误导致，具体可以查血[反射](./Reflect.md)相关知识
+比如反射这个`Path.Error`结构体
+
+```golang
+f, err := os.Open("nonexists.txt")
+if err != nil {
+	errorType := reflect.TypeOf(err).Elem()
+
+	// 遍历结构体字段
+	fmt.Println("Fields:")
+	for i := 0; i < errorType.NumField(); i++ {
+		field := errorType.Field(i)
+		fmt.Printf("- %s %s\n", field.Name, field.Type)
+	}
+
+	// 遍历结构体方法
+	fmt.Println("Methods:")
+	for i := 0; i < errorType.NumMethod(); i++ {
+		method := errorType.Method(i)
+		fmt.Printf("- %s %s\n", method.Name, method.Type)
+	}
+	os.Exit(-1)
+}
+f.Close()
+```
+执行后应该打印出以下内容
+```bash
+root@iZt4neudsfea8pyuih28ydZ:~/go-learn# go run main.go 
+Fields:
+- Op string
+- Path string
+- Err error
+Methods:
+```
 
 3. defer 的概念非常有趣，也很符合 Go 的设计主旨，不知道 Go 语言中是否有类似 Python 中上下文管理器的工具（即实现打开文件时确保其使用后被关闭，上锁时确保使用后会开锁等操作）
 

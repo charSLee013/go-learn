@@ -156,88 +156,106 @@ func ValueOf(i any) Value {
 
 	return unpackEface(i)
 }
+
+```
+注意的是，同`TypeOf`不同的是，复制过来的值`i`会被显式逃逸到堆上，栈上保留的是指向`i`的指针
+然后使用`unpackEface`对`i`进行解包返回指向`Value`类型的指针
+
+```golang
+// unpackEface将空接口i转换为Value。
+
+func unpackEface(i any) Value {
+	// 将i转换为emptyInterface类型的指针e
+	e := (*emptyInterface)(unsafe.Pointer(&i))
+
+	// 注意：在我们确定e.word是指针还是非指针之前，不要读取e.word。
+	t := e.typ
+
+	// 如果t为空，则返回一个空的Value
+	if t == nil {
+		return Value{}
+	}
+
+	// 根据t的Kind确定元数据标志位f
+	f := flag(t.Kind())
+
+	// 如果t是通过间接方式传递（indirect），则设置flagIndir标志位
+	if ifaceIndir(t) {
+		f |= flagIndir
+	}
+
+	// 返回一个包含类型t、数据指针e.word和标志位f的Value
+	return Value{t, e.word, f}
+}
 ```
 
-注意！获得的值是原来的拷贝，修改通过反射获得的值并不会改变原来对象的值，比如下面的这个例子
 
+下面是返回值`Value`结构体的源代码
+```golang
+// Value是对Go值的反射接口。
+
+type Value struct {
+    typ *rtype  // 指向该值的元数据指针
+    ptr unsafe.Pointer  // 数据的指针
+    flag  // 元数据标志位
+
+    // flag元数据标志位的含义：
+    //  - flagStickyRO: 是否通过未公开的非嵌入字段获取，从而为只读
+    //  - flagEmbedRO: 是否通过未公开的嵌入字段获取，从而为只读
+    //  - flagIndir: 是否val保存了一个指向数据的指针
+    //  - flagAddr: v.CanAddr是否为true（implies flagIndir）
+    //  - flagMethod: v是否为一个方法值
+
+    // 方法值表示某个接收器r的柯里化方法调用，例如r.Read。typ+val+flag位描述了接收器r，
+    // 但是flag的Kind位表示Func（方法是函数），并且flag的最高位给出了r的类型的方法表中的方法编号。
+}
+```
+
+### 陷阱
+想象下面的代码
 ```golang
 package main
 
-import (
-	"fmt"
-	"reflect"
-)
+import "reflect"
 
 func main() {
-	num := 10
-	value := reflect.ValueOf(&num).Elem() // 获取可修改的反射值
-
-	fmt.Println("原始值:", num) // 输出: 原始值: 10
-
-	// 修改反射值
-	value.SetInt(20)
-
-	fmt.Println("修改后的值 (反射):", value.Int()) // 输出: 修改后的值 (反射): 20
-	fmt.Println("原始值:", num) // 输出: 原始值: 20
+	a:= 123
+	v:= reflect.ValueOf(a)
+	v.SetInt(321)
+	println(a)
 }
-
 ```
 
+我们定义了一个`int`类型然后使用反射`reflect.ValueOf`获得变量的值，然后修改`int`类型为321，最后打印出来
+```bash
+panic: reflect: reflect.Value.SetInt using unaddressable value
+```
 
-## 例子
+但实际运行起来确发生了`panic`，发生了什么?
+如果你还记得Golang的操作语义的话
+> As in all languages in the C family, everything in Go is passed by value. That is, a function always gets a copy of the thing being passed, as if there were an assignment statement assigning the value to the parameter. For instance, passing an int value to a function makes a copy of the int, and passing a pointer value makes a copy of the pointer, but not the data it points to
+> 具体可以查看[官方文档FAQ部分](https://go.dev/doc/faq#pass_by_value)
 
+`a`自然是存在于栈上的一个整数，根据Golang定义的值拷贝传参，我们其实只是传入了"123"这个数字而已，而reflect包操作的值必须可以寻址(addressable),即有一个内存地址可以变更。但非地址able的值如a没有一个内存地址可以变更,它只是一个不可变的拷贝。
+
+换句话说,当你传入一个值类型变量给`reflect.ValueOf`,你会获得这个值的一个拷贝,而丢失了指向原始变量的链接。所以reflect包无法修改这个非地址able的值,否则就破坏了Go的值不可变性。
+
+那什么是**addressable value**?
+
+简单来说,所有可以取地址的变量都是addressable的,比如指针,slice,map,channel等。
+
+而在我们的例子中可以改成下面的代码
 ```golang
-package main
-
-import (
-	"fmt"
-	"reflect"
-)
-
-type MyInterface interface {
-	ExportedMethod()
-	unexportedMethod()
-}
-
-type MyStruct struct{}
-
-func (s *MyStruct) ExportedMethod() {
-	fmt.Println("Exported method called")
-}
-
-func (s *MyStruct) unexport1() {
-	fmt.Println("Unexported method called")
-}
-
-func (s *MyStruct) unexportedMethod() {
-	fmt.Println("Unexported method called")
-}
-
-func main() {
-	myStruct := &MyStruct{}
-	myInterface := (*MyInterface)(nil)
-
-	structType := reflect.TypeOf(myStruct)
-	interfaceType := reflect.TypeOf(myInterface).Elem()
-
-	structNumMethod := structType.NumMethod()
-	interfaceNumMethod := interfaceType.NumMethod()
-
-	fmt.Println("Number of methods for struct:", structNumMethod)
-	fmt.Println("Number of methods for interface:", interfaceNumMethod)
-
-	firstMethod := structType.Method(0)
-	fmt.Printf("[Struct]Func name: %v \t receiver: %v\t func: %v\n", firstMethod.Name, firstMethod.Type,firstMethod.Func)
-
-	firstMethodOfInterface := interfaceType.Method(0)
-	fmt.Printf("[Interface]Func name: %v \t receiver: %v\t func: %v\n", firstMethodOfInterface.Name, firstMethodOfInterface.Type,firstMethodOfInterface.Func)
-
-	// 通过反射调用 ExportedMethod 方法
-	methodValue := reflect.ValueOf(myStruct).MethodByName("ExportedMethod")
-	methodValue.Call(nil)
-}
+	var a *int = new(int)
+	*a = 123
+	// reflect.ValueOf 返回值的副本,对指针也是一层间接引用
+	v:= reflect.ValueOf(a)
+	// 需要先 Elem() 解引用,得到实际的值对象
+	v.Elem().SetInt(321)
+	println(*a)
 ```
 
+这里我们传入的是`*int`类型，是一个`int`类型的指针，然后通过`Elem()`解应用后的`Value`调用`SetInt`等方法修改
 
 # 参考
 
