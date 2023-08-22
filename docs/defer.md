@@ -222,11 +222,218 @@ type _defer struct {
 
 再来看下性能基准测试的结果
 ```
-
+goos: linux
+goarch: amd64
+BenchmarkDefer-2        20000000                58.2 ns/op
+PASS
+ok      command-line-arguments  1.237s
 ```
 
 ### go-1.13
 
+我们再来看下**go1.13**下展开的伪代码
+```golang
+func A(){
+	// create strcut and saved to stack
+	var d struct {
+		runtime._defer
+		i int
+	}
+	d.size = 0
+	d.fn = B
+	d.i = 10
+	r := runtime.deferprocStack(&d._defer)
+
+	// code to do something
+	runtime.deferreturn()
+	return
+}
+```
+通过在编译阶段，在函数内增加`d strct`结构体的局部变量，将`defer`信息保存在当前函数栈帧的局部变量区域，再通过`deferprocStack`把栈上这个`_defer`结构体注册到`g._defer`链表中
+
+go1.13的优化主要是减少`defer`信息的堆分配，之所以是减少了，像下面这种在`for`循环里面注册`defer`
+```golang
+for i:=0;i<n;i++{
+	defer B(i)
+}
+```
+
+或者隐式循环
+```golang
+again:
+	defer B()
+	if i <n {
+		n++
+		goto again
+	}
+```
+依然需要使用经典处理方式--在堆上分配`defer`信息。为了区分在是否在堆上分配的`defer`，在go1.13中为`_defer`结构体新增了一个字段，具体如下所示或者直接[点击查看](https://github.com/golang/go/blob/2bc8d90fa21e9547aeb0f0ae775107dc8e05dc0a/src/runtime/runtime2.go#L784)源代码
+
+```golang
+type _defer struct {
+	...
+	heap    bool //用于标识是否为堆分配
+	...
+}
+```
+在栈上分配的情况如图所示
+![go1.13 defer](./images/go1.13%20defer.png)
+
+再来看下性能基准测试的结果
+```
+goos: linux
+goarch: amd64
+BenchmarkDefer-2        27385267                44.1 ns/op
+PASS
+ok      command-line-arguments  1.257s
+```
+相比之后并没有官方吹的提升30%那么猛，但是也足够了
+
+### go-1.14
+go1.14直接就对`defer`进行了大刀阔斧的优化了，首先来个示例代码
+```golang
+func A(i int){
+	defer A1(i, 2*i)
+
+	// code to something
+
+	if (i>1) {
+		defer A2("hello","world")
+	}
+
+	// code to something
+	return
+}
+
+func A1(a,b int){
+	...
+}
+
+func A2(m,n string){
+	...
+}
+```
+
+我们首先看第一个`defer`函数，需要传入两个变量，此时golang在编译阶段在函数内插入变量的初始化以备`defer`函数调用  
+```golang
+var a,b int = i,2*i
+```
+
+然后在函数返回之前直接调用`defer`注册的函数--**A1**即可
+```golang
+A1(a,b)
+return
+```
+
+省去了构造`defer`以及注册到`g._defer`链表的过程,也同样实现了`defer`函数延迟执行的效果
+
+不过运行时才确定的`defer`就不能这么简单的处理了，比如下面这个
+```golang
+if (i > 1){
+	defer A2()
+}
+```
+
+为了知道运行时是否要执行这个`defer`函数，Golang用一个标识变量`df`来解决这个问题
+```golang
+var df byte
+```
+
+`df`是一个`byte`类型的变量，大小为**8bit**,其中每一**bit** 控制`defer`函数是否应该执行，整个数据结构图示如下
+
+![open close defer](./images/open%20close%20defer.png)
+
+那么此时只有运行时候才能确定是否要执行的`defer`函数，展开后的伪代码如下
+```golang
+if (i > 1){
+	df |= 2
+}
+```
+
+然后到了函数返回的时候根据`df`的上每位对应**bit**位来确定时候运行
+```golang
+if df &2 > 0{
+	df = df &^ 2	// 把df对应标识位置设为0，避免重复执行
+}
+```
+
+此时整个代码的伪代码展开是这样的
+```golang
+func A(i int){
+	var df byte
+	var a,b int = i,2*i
+
+	df |= 1		// 设置为1表明要执行第一个defer函数
+
+	//code to do something
+	var m,n string = "hello","world"
+
+	if i > 1{
+		df |= 2	// 设置为2表明要执行第二个defer函数
+	}
+
+	// code to do something
+	if df&2 > 0{
+		df = df&^2
+		A2(m,n)
+	}
+
+	if df&1 > 0{
+		df = df &^1
+		A1(a,b)
+	}
+
+	return
+}
+```
+
+可以到优化的地方在于通过在编译阶段插入代码，把`defer`函数的执行逻辑展开在所属函数内,从而避免创建`_defer`结构体,也不需要注册到`defer`链表中
+
+但是跟go1.13版本一样，遇到循环只能回退到经典模式--在堆上创建`defer`信息并且链接到`g._defer`链表上
+
+再来看下性能基准测试的结果
+```
+goos: linux
+goarch: amd64
+BenchmarkDefer-2        175151754                6.37 ns/op
+PASS
+ok      command-line-arguments  1.813s
+```
+优化性能显著提高
+
+### 代价
+
+想象一下，如果在函数执行过程发生了`panic`了，在编译阶段里面展开的`open-close defer`会怎么办？
+
+```golang
+	painc("painc for error") // 比如这里发生了painc
+	// 这里已经无法执行了
+	if df&2 > 0{
+		df = df&^2
+		A2(m,n)
+	}
+	...
+```
+
+这个时候就需要记录下未注册的`defer`信息，所以1.14版本在`_defer`结构体上新增加了几个[字段](https://github.com/golang/go/blob/5cf057ddedfbb149b71c85ec86050431dd6b2d9d/src/runtime/runtime2.go#L865)
+```golang
+type _defer struct {
+	...
+	openDefer bool	// 标识是否为openDefer类型
+
+	// 如果openDefer为true,下面的字段记录与拥有内联defer的栈帧
+	// 和相关函数有关的值。上面的sp将是栈帧的sp,pc将是
+	// 函数内deferreturn调用的地址。
+	fd   unsafe.Pointer  // 与栈帧相关函数的funcdata
+	varp uintptr        // 栈帧的varp的值
+  // framepc是与栈帧相关的当前pc。与上面的sp(栈帧的sp)
+  // 一起,framepc/sp可以作为pc/sp对,通过gentraceback()
+  // 继续进行堆栈追踪。
+	framepc uintptr
+}
+```
+
+借助这些信息可以找到未注册到链表的`defer`函数
 
 
 ### openDefer
