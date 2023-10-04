@@ -149,7 +149,7 @@ go tool objdump -S -s main.A main.o
 
 # defer 优化
 
-## 演变过程
+## 树立测试基准
 为了更佳直观和量化优化后的性能，以下面的代码作为基准测试的标准
 ```golang
 package main
@@ -184,7 +184,7 @@ go test bench=.
 ```
 
 ### go-1.12
-我们先忽略`painc`和`recover`相关的逻辑，考虑下面的
+我们从golang1.12开始，先忽略`painc`和`recover`相关的逻辑，考虑下面这个代码的
 ```golang
 func A(){
 	defer B(10)
@@ -220,7 +220,7 @@ type _defer struct {
 ```
 此时还是在函数的返回之前，通过链表的方式按照FILO顺序依次执行注册的`defer`函数
 
-再来看下性能基准测试的结果
+再来看下golang1.12的性能基准测试的结果
 ```
 goos: linux
 goarch: amd64
@@ -230,8 +230,18 @@ ok      command-line-arguments  1.237s
 ```
 
 ### go-1.13
+还是一样的伪代码
+```golang
+func A(){
+	defer B(10)
+	// code to do something
+}
+func B(i int){
+	...
+}
+```
 
-我们再来看下**go1.13**下展开的伪代码
+我们再来看下在**go1.13**下是展开的伪代码是怎么样的
 ```golang
 func A(){
 	// create strcut and saved to stack
@@ -435,25 +445,10 @@ type _defer struct {
 
 借助这些信息可以找到未注册到链表的`defer`函数
 
-
-### openDefer
-> [开发式延迟调用](https://github.com/golang/proposal/blob/master/design/34481-opencoded-defers.md)
-> 该项提议[Proposal: Low-cost defers through inline code, and extra funcdata to manage the panic case](https://go.googlesource.com/proposal/+/refs/heads/master/design/34481-opencoded-defers.md)
-开放式延迟调用（**Open-ended defer**）是Go语言中的一种特殊形式的延迟调用。
-
-在普通的延迟调用中，我们使用`defer`关键字将一个函数调用添加到函数返回之前执行。这些延迟调用的数量通常是确定的，并且在函数退出时以反序执行。
-
-而开放式延迟调用是一种更为复杂的情况，在这种情况下，函数可能会在延迟调用的同时启动新的Goroutine，而新的Goroutine也可以注册延迟调用。这导致了在函数退出时可能存在多个活跃的延迟调用。这个过程中，Goroutine和延迟调用之间存在着一种复杂的依赖关系。
-
-为了管理这种复杂性，Go语言中的运行时会为具有开放式延迟调用的函数框架创建一个特殊的 _defer 结构体。这个结构体用于跟踪与开放式延迟调用相关的信息，例如栈帧、函数数据等。
-
-开放式延迟调用通常用于需要在函数返回之前执行清理操作或处理资源释放的复杂逻辑中，例如数据库连接的关闭、文件的关闭等。
-
-
-
-
-
 ## 练习
+---
+
+思考下面每个函数调用的返回值和调用顺序
 ```golang
 package main
 
