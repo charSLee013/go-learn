@@ -2,20 +2,21 @@ package main
 
 import (
 	"fmt"
+	"time"
 )
 
 func main() {
-	A()
-}
+	ch := make(chan int)
 
-func A1(a int){
-	fmt.Println(a)
-}
+	go func() {
+		time.Sleep(2 * time.Second)
+		ch <- 123
+	}()
 
-func A(){
-	a,b := 1,2
-	defer A1(a)	// 此刻a=1已经在defer结构体内复制好数据了，不受外部a的影响
-	panic("some thing error")
-	a = a + b
-	fmt.Println(a,b)
+	select {
+	case value := <-ch:
+		fmt.Println("Received value from ch:", value)
+	default:
+		fmt.Println("No value available from ch")
+	}
 }

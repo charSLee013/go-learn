@@ -1,3 +1,19 @@
+# Table of Contents
+
+- [Table of Contents](#table-of-contents)
+- [Defer](#defer)
+	- [深入](#深入)
+- [defer 优化](#defer-优化)
+	- [树立测试基准](#树立测试基准)
+		- [go-1.12](#go-112)
+		- [go-1.13](#go-113)
+		- [go-1.14](#go-114)
+		- [代价](#代价)
+	- [练习](#练习)
+- [参考](#参考)
+
+---
+
 # Defer
 > In Golang, the defer keyword is used to delay the execution of a function until the surrounding function completes. The deferred function calls are executed in Last-In-First-Out (LIFO) order.
 
@@ -543,4 +559,4 @@ func namedVarReturn6() {
 
 
 # 参考
- 
+[what is defer](https://tpaschalis.me/defer-internals/)
