@@ -376,3 +376,228 @@ func main() {
 	}
 }
 ```
+
+### 非阻塞并超时控制
+
+```golang
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	ch := make(chan int)
+
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		ch <- 123
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	select {
+	case value := <-ch:
+		fmt.Println("Received value from ch:", value)
+	case <-ctx.Done():
+		fmt.Println("Timeout occurred")
+	}
+}
+```
+
+## 多路选择
+当使用select 语句在多个通道操作之间进行选择，比如下面这个例子
+
+```golang
+var a,b int
+b = 10
+select {
+	case a=<-ch1:	// 执行接收操作
+		fmt.Println(a)
+	case ch2 <- b:	// 执行发送操作
+	default:		// 当没有任何通道操作准备就绪时执行的逻辑，如果注释掉这一行，则必须要满足任意条件后select 才能继续
+}
+```
+
+多路select会被编译器转换为[runtime.selectgo](https://github.com/golang/go/blob/8c92897e15d15fbc664cd5a05132ce800cf4017f/src/runtime/select.go#L121)函数调用
+```golang
+// selectgo implements the select statement.
+//
+// cas0 points to an array of type [ncases]scase, and order0 points to
+// an array of type [2*ncases]uint16 where ncases must be <= 65536.
+// Both reside on the goroutine's stack (regardless of any escaping in
+// selectgo).
+//
+// For race detector builds, pc0 points to an array of type
+// [ncases]uintptr (also on the stack); for other builds, it's set to
+// nil.
+//
+// selectgo returns the index of the chosen scase, which matches the
+// ordinal position of its respective select{recv,send,default} call.
+// Also, if the chosen scase was a receive operation, it reports whether
+// a value was received.
+func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, block bool) (int, bool)
+```
+
+* cae0: 指向一个`ncases`大小的`scase`数组，里面装的是select中所有的`case`分支
+数组里面的case分支的顺序是由select语句中的case分支的顺序决定的，它们是一一对应的
+
+cas0数组里面的case分支的顺序并不影响select语句的执行结果，因为select语句会随机打乱cas0数组的顺序，然后遍历cas0数组，检查每个case分支是否可以执行。这样做是为了保证select语句在多个case分支都可以执行时，能够随机选择一个执行，而不是总是选择第一个或最后一个。
+
+cas0数组里面的case分支的顺序只在有default case时有一些影响，因为default case总是放在cas0数组的最后一个位置。这意味着如果没有任何其他case分支可以执行，那么select语句会直接执行default case，而不会调用runtime.block函数来阻塞当前的goroutine。
+
+* order0: 指向一个uint16类型的数组，大小是ncases的两倍即等于case分支数量的两倍
+里面存放了每个`case`分支的下标，比如说 [0, 1, 2, 0, 1, 2]
+该数组被分为大小相同的两个数组[`polloder`和`lockorder`](https://github.com/golang/go/blob/8c92897e15d15fbc664cd5a05132ce800cf4017f/src/runtime/select.go#L133C7-L133C7)
+`polloder`用来对所有的channel的轮询进行乱序
+`lockorder`用来对所有的channel的加锁操作进行排序
+乱序执行能**保障公平性**
+有序加锁**避免死锁**
+
+* pc0: 是一个指向[ncases]uintptr类型数组的指针，它表示case分支的程序计数器（PC）。这个参数只在race detector构建时使用，其他情况下设为nil。
+
+* nsends和nrecvs是两个整数，分别表示select语句中执行`send`和`recv`操作的分支分别有多少个，二者总和不能超过65536(即uint16的大小)
+
+* block: 表示select语句是否需要阻塞等待通信操作,对应代码里面就是有`default`分支的不会阻塞 
+
+整个传入数据内存布局如下:
+![selectgo](./images/selectgo.png)
+
+接下来再看下[`scase`结构体](https://github.com/golang/go/blob/8c92897e15d15fbc664cd5a05132ce800cf4017f/src/runtime/select.go#L19)
+```golang
+// Select case descriptor.
+type scase struct {
+	c    *hchan         // chan
+	elem unsafe.Pointer // data element
+}
+```
+
+* `c`: 指向case分支的所对应的channel的指针
+* `elem`: 它表示`case`分支中涉及到的数据元素。如果`case`分支是一个发送操作，那么`elem`表示要发送到通道的值；如果`case`分支是一个接收操作，那么`elem`表示从通道接收到的值。
+
+
+对于返回值(int, bool)分别代表着所对应的`case`分支和当执行`v,ok:=<-ch`的时候`ok`标识
+
+### select 过程
+> 建议去看 https://www.bilibili.com/video/av246038798?p=29 有更加直观的动画过程
+接下来我们根据`selectgo`的[源代码](https://github.com/golang/go/blob/8c92897e15d15fbc664cd5a05132ce800cf4017f/src/runtime/select.go#L121)撸一遍
+这里简单的阐述一下
+
+1. 将接收的`cas0`和`order0`转化成65536个scase数组和 2*65536个unit16数组
+```golang
+	cas1 := (*[1 << 16]scase)(unsafe.Pointer(cas0))
+	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
+```
+
+2. 计算出有channel读写操作的case分支的数量，并从`cas1`和`order1`中获取这些分支
+
+```golang
+	ncases := nsends + nrecvs
+	scases := cas1[:ncases:ncases]
+	pollorder := order1[:ncases:ncases]
+	lockorder := order1[ncases:][:ncases:ncases]
+```
+
+* `scases`: 表示select语句中的各个case分支，包括涉及到的通道和数据元素,该操作将切片的长度和容量都为`ncases`,这样做是为了只保留有channel操作的`case`分支
+* `pollorder`: 将order1数组的前`ncases`切片作为乱序执行的操作空间
+* `lockorder`: 将`order1`数组的后`ncases`切片作为有序加锁的空间
+
+
+3. 遍历`scases`数组来对`case`执行顺序进行洗牌
+```golang
+	// generate permuted order
+	norder := 0
+	for i := range scases {
+		cas := &scases[i]
+
+		// Omit cases without channels from the poll and lock orders.
+		if cas.c == nil {
+			cas.elem = nil // allow GC
+			continue
+		}
+
+		j := fastrandn(uint32(norder + 1))
+		pollorder[norder] = pollorder[j]
+		pollorder[j] = uint16(i)
+		norder++
+	}
+	pollorder = pollorder[:norder]
+	lockorder = lockorder[:norder]
+```
+在洗牌的过程中，对于没有`channel`实际地址的case分支**不参与**乱序执行+有序加锁的过程
+并且还将其elem字段设为nil以方便GC
+
+4. 使用堆排序，按照`scases`数组对应的**通道地址从小到大排序**后放入到`lockorder`中
+保证在**顺序加锁**，**逆序解锁**,从而避免死锁
+```golang
+	// sort the cases by Hchan address to get the locking order.
+	// simple heap sort, to guarantee n log n time and constant stack footprint.
+	for i := range lockorder {
+		...
+	}
+```
+
+
+5. 将`lockorder`中所有的`scase`进行有序加锁
+```golang
+	// lock all the channels involved in the select
+	sellock(scases, lockorder)
+```
+
+
+6. 遍历`pollorder`数组，已经准备好的通道操作，则会通过跳转到相应的标签来执行对应的操作，并且在操作完成之后根据情况（比如channel 已经关闭)是否还需要继续遍历还是退出
+
+如果没有找到准备好的通道操作，并且不允许阻塞，则会在最后的判断中解锁并返回
+
+```golang
+	// pass 1 - look for something already waiting
+	for _, casei := range pollorder {
+	}
+```
+
+7. 如果之前的步骤没有可操作步骤并且允许阻塞，则将遍历所有的`lockorder`数组
+获取一个空闲的`sudog`结构体，并将该`sg`放入到对应的channel的`sendq`或者`recvq`等待数组中
+
+```golang
+	// pass 2 - enqueue on all chans
+	for _, casei := range lockorder {
+	}
+```
+
+8. 然后将自身goroutine进入休眠，并且释放掉自身的锁(channel的锁是锁在某一个goroutine上面的)
+```golang
+	// wait for someone to wake us up
+	gp.param = nil
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+	// 将当前goroutine挂起，并传递selparkcommit函数、waitReasonSelect原因、traceBlockSelect事件和1标志
+	gopark(selparkcommit, nil, waitReasonSelect, traceBlockSelect, 1)
+```
+
+
+9. 唤醒成功后，先对`lockorder`进行加锁
+然后遍历`lockorder`找到被唤醒的`case`分支，并且将自身从其他的`channel`等待队列中移除自身
+```golang
+	sellock(scases, lockorder)
+	// pass 3 - dequeue from unsuccessful chans
+	// otherwise they stack up on quiet channels
+	// record the successful case, if any.
+	// We singly-linked up the SudoGs in lock order.
+	for _, casei := range lockorder {
+		if sg == sglist {
+		}
+	}
+```
+
+10. 解锁所有的`lockorder`然后退出
+
+
+# 参考
+---
+
+[How does select work when multiple channels are involved?](https://stackoverflow.com/questions/47645808/how-does-select-work-when-multiple-channels-are-involved)
